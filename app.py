@@ -1,197 +1,150 @@
-import io
-import joblib
+# app.py
+import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import streamlit as st
+import joblib
+import os
 
-from sklearn.metrics import (
-    confusion_matrix,
-    ConfusionMatrixDisplay,
-    roc_curve,
-    auc,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score
-)
+st.set_page_config(page_title="Churn Predictor", layout="wide")
+st.title("Prediksi Churn Customer (Random Forest)")
 
 # =========================
-# CONFIG
+# PATH
 # =========================
-st.set_page_config(page_title="Churn Risk Analysis", layout="wide")
-st.title("Churn Risk Analysis")
-st.caption(
-    "Pipeline: Klasifikasi (Random Forest) → Regresi (Ensemble VotingRegressor). "
-    "Tanpa KNN dan tanpa Decision Tree tunggal."
-)
+MODEL_PATH = "models/rf_clf.joblib"
+FEATURE_COLS_PATH = "models/feature_cols.joblib"
 
 # =========================
-# LOAD MODEL & ARTIFACT
+# LOAD
 # =========================
-try:
-    clf = joblib.load("rf_classifier.pkl")
-    reg = joblib.load("reg_ensemble.pkl")
-    base_cols = joblib.load("feature_columns_base.pkl")
-except Exception as e:
-    st.error("Model tidak ditemukan. Pastikan file berikut ada satu folder dengan app.py:")
-    st.code(
-        "rf_classifier.pkl\n"
-        "reg_ensemble.pkl\n"
-        "feature_columns_base.pkl\n"
-        "requirements.txt"
-    )
-    st.exception(e)
-    st.stop()
+@st.cache_resource
+def load_artifacts():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model tidak ditemukan: {MODEL_PATH}")
 
-# =========================
-# PREPROCESS FUNCTION
-# =========================
-def preprocess_base(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    model = joblib.load(MODEL_PATH)
 
-    if "customer_id" in df.columns:
-        df = df.drop(columns=["customer_id"])
+    if not os.path.exists(FEATURE_COLS_PATH):
+        raise FileNotFoundError(
+            f"feature_cols tidak ditemukan: {FEATURE_COLS_PATH}\n"
+            f"Simpan dulu list X.columns saat training ke file ini."
+        )
 
-    if "churn_risk" in df.columns:
-        df = df.drop(columns=["churn_risk"])
+    feature_cols = joblib.load(FEATURE_COLS_PATH)
 
-    # tanggal ke numerik
-    if "first_purchase_date" in df.columns:
-        df["first_purchase_date"] = pd.to_datetime(df["first_purchase_date"], errors="coerce")
-    if "last_purchase_date" in df.columns:
-        df["last_purchase_date"] = pd.to_datetime(df["last_purchase_date"], errors="coerce")
+    # Validasi sederhana
+    if not isinstance(feature_cols, (list, tuple)) or len(feature_cols) == 0:
+        raise ValueError("feature_cols.joblib harus berisi list kolom fitur (X.columns).")
 
-    if "first_purchase_date" in df.columns and "last_purchase_date" in df.columns:
-        df["customer_age_days"] = (
-            df["last_purchase_date"] - df["first_purchase_date"]
-        ).dt.days
+    return model, list(feature_cols)
 
-    for c in ["first_purchase_date", "last_purchase_date"]:
-        if c in df.columns:
-            df = df.drop(columns=[c])
+rf_clf, FEATURE_COLS = load_artifacts()
 
-    df = df.fillna(0)
-
-    # samakan kolom dengan saat training
-    for c in base_cols:
-        if c not in df.columns:
-            df[c] = 0
-
-    return df[base_cols]
+st.caption(f"Jumlah fitur model: {len(FEATURE_COLS)}")
 
 # =========================
-# UPLOAD DATA
+# HELPER
 # =========================
-uploaded = st.file_uploader("Upload file CSV", type=["csv"])
-if not uploaded:
-    st.info("Silakan upload file CSV terlebih dahulu.")
-    st.stop()
+def build_input_row(feature_cols: list[str]) -> pd.DataFrame:
+    """
+    Buat 1 baris input dari user.
+    - Untuk fitur tanggal: pakai first_purchase_date dan last_purchase_date jika memang ada di training,
+      tapi preprocessing kamu akhirnya drop dua kolom tanggal dan pakai customer_age_days.
+    - Jadi di sini kita akan selalu minta input tanggal, lalu bikin customer_age_days.
+    - Kolom lain dibuat dari input numerik.
+    """
 
-df_raw = pd.read_csv(uploaded)
+    st.subheader("Input Data Customer")
 
-st.subheader("Preview Data")
-st.dataframe(df_raw.head(10), use_container_width=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        first_date = st.date_input("First Purchase Date")
+    with c2:
+        last_date = st.date_input("Last Purchase Date")
 
-X_base = preprocess_base(df_raw)
+    # Siapkan dict untuk 1 baris data
+    row = {}
+
+    # Isi semua fitur selain kolom tanggal, dengan input numerik default.
+    # Karena kita tidak tahu tipe setiap kolom dari dataset kamu, kita buat input float.
+    st.markdown("### Input Fitur (Numerik)")
+    cols_ui = st.columns(3)
+    col_idx = 0
+
+    # Kolom tanggal biasanya sudah kamu drop saat training, jadi jangan ikut di sini
+    skip_cols = {"first_purchase_date", "last_purchase_date"}
+
+    for col in feature_cols:
+        if col in skip_cols:
+            continue
+
+        with cols_ui[col_idx % 3]:
+            row[col] = st.number_input(
+                label=col,
+                value=0.0,
+                step=1.0,
+                format="%.4f"
+            )
+        col_idx += 1
+
+    # Tambahkan tanggal untuk proses customer_age_days
+    row["first_purchase_date"] = pd.to_datetime(first_date)
+    row["last_purchase_date"] = pd.to_datetime(last_date)
+
+    X_input = pd.DataFrame([row])
+
+    # Preprocessing tanggal sesuai kode kamu:
+    X_input["first_purchase_date"] = pd.to_datetime(X_input["first_purchase_date"], errors="coerce")
+    X_input["last_purchase_date"] = pd.to_datetime(X_input["last_purchase_date"], errors="coerce")
+    X_input["customer_age_days"] = (X_input["last_purchase_date"] - X_input["first_purchase_date"]).dt.days
+    X_input = X_input.drop(columns=["first_purchase_date", "last_purchase_date"])
+
+    # Handle missing
+    X_input = X_input.fillna(0)
+
+    # Samakan kolom dengan training
+    # Jika training kamu punya customer_age_days, harus ada di FEATURE_COLS
+    X_final = X_input.reindex(columns=feature_cols, fill_value=0)
+
+    return X_final
+
 
 # =========================
-# STEP 1: KLASIFIKASI
+# BUILD INPUT
 # =========================
-st.header("Step 1: Klasifikasi (Random Forest)")
+X_final = build_input_row(FEATURE_COLS)
 
-pred_class = clf.predict(X_base)
-proba_churn1 = clf.predict_proba(X_base)[:, 1]
+with st.expander("Lihat data input (setelah preprocessing)"):
+    st.dataframe(X_final, use_container_width=True)
 
-c1, c2 = st.columns(2)
+# =========================
+# PREDICT
+# =========================
+st.markdown("### Prediksi")
+btn = st.button("Prediksi Churn")
 
-with c1:
-    fig = plt.figure()
-    pd.Series(pred_class).value_counts().sort_index().plot(kind="bar")
-    plt.title("Distribusi Prediksi Kelas Churn")
-    plt.xlabel("Kelas")
-    plt.ylabel("Jumlah")
-    st.pyplot(fig)
+if btn:
+    pred_class = int(rf_clf.predict(X_final)[0])
+    pred_proba = float(rf_clf.predict_proba(X_final)[:, 1][0])
 
-with c2:
-    if "churn_risk" in df_raw.columns:
-        y_true_bin = (df_raw["churn_risk"] >= 0.5).astype(int)
-        cm = confusion_matrix(y_true_bin, pred_class, labels=[0, 1])
-        fig = plt.figure()
-        disp = ConfusionMatrixDisplay(cm, display_labels=[0, 1])
-        disp.plot(values_format="d")
-        plt.title("Confusion Matrix")
-        st.pyplot(fig)
+    cA, cB, cC = st.columns(3)
+    with cA:
+        st.metric("Prediksi Kelas", pred_class)
+        st.caption("0 = tidak churn, 1 = churn")
+    with cB:
+        st.metric("Probabilitas Churn", f"{pred_proba:.3f}")
+    with cC:
+        st.metric("Threshold", "0.500")
+
+    st.divider()
+
+    if pred_proba >= 0.5:
+        st.warning("Risiko churn tinggi (>= 0.5).")
     else:
-        st.info("Confusion Matrix tampil jika kolom churn_risk tersedia.")
+        st.success("Risiko churn rendah (< 0.5).")
 
-# ROC Curve
-if "churn_risk" in df_raw.columns:
-    st.subheader("ROC Curve (Klasifikasi)")
-    y_true_bin = (df_raw["churn_risk"] >= 0.5).astype(int)
-
-    fpr, tpr, _ = roc_curve(y_true_bin, proba_churn1)
-    roc_auc = auc(fpr, tpr)
-
-    fig = plt.figure()
-    plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
-    plt.plot([0, 1], [0, 1], linestyle="--")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("ROC Curve")
-    plt.legend()
-    st.pyplot(fig)
-
-# =========================
-# STEP 2: REGRESI + ENSEMBLE
-# =========================
-st.header("Step 2: Regresi (Ensemble VotingRegressor)")
-
-X_reg = X_base.copy()
-X_reg["pred_proba_churn1"] = proba_churn1
-
-pred_reg = reg.predict(X_reg)
-
-fig = plt.figure()
-plt.hist(pred_reg, bins=30)
-plt.title("Distribusi Prediksi churn_risk")
-plt.xlabel("Nilai churn_risk")
-plt.ylabel("Frekuensi")
-st.pyplot(fig)
-
-if "churn_risk" in df_raw.columns:
-    st.subheader("Actual vs Predicted (Regresi)")
-    y_true_reg = df_raw["churn_risk"].astype(float)
-
-    fig = plt.figure()
-    plt.scatter(y_true_reg, pred_reg)
-    plt.xlabel("Actual churn_risk")
-    plt.ylabel("Predicted churn_risk")
-    plt.title("Actual vs Predicted")
-    st.pyplot(fig)
-
-    st.subheader("Evaluasi Regresi")
-    st.write("MAE:", mean_absolute_error(y_true_reg, pred_reg))
-    st.write("MSE:", mean_squared_error(y_true_reg, pred_reg))
-    st.write("R2 :", r2_score(y_true_reg, pred_reg))
-
-# =========================
-# OUTPUT EXCEL
-# =========================
-hasil = df_raw.copy()
-hasil["prediksi_kelas_churn"] = pred_class
-hasil["prob_kelas1"] = proba_churn1
-hasil["prediksi_nilai_churn_risk"] = pred_reg
-
-st.subheader("Hasil Akhir (Preview)")
-st.dataframe(hasil.head(10), use_container_width=True)
-
-buffer = io.BytesIO()
-with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-    hasil.to_excel(writer, index=False, sheet_name="hasil_pipeline")
-
-st.download_button(
-    "Download Hasil (Excel)",
-    buffer.getvalue(),
-    file_name="hasil_pipeline.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
+    st.markdown("#### Interpretasi singkat")
+    st.write(
+        "Model menghasilkan label churn (0/1) dan probabilitas churn (0 sampai 1). "
+        "Probabilitas lebih cocok untuk analisis risiko dan penentuan tindakan (retention)."
+    )
